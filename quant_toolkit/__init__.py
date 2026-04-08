@@ -16,7 +16,7 @@ import pandas as pd
 from scipy import stats
 from statsmodels.tsa.stattools import coint
 import warnings
-
+from scipy.stats import linregress, f as f_dist, spearmanr
 
 
 def coint_test(y, x):
@@ -240,4 +240,124 @@ def adjust_positions_for_holding_period(positions, holding_period):
     positions_hold_period = positions.where(rebalance_mask).ffill()
     positions_hold_period.name = f"{positions.name}_{holding_period}hold_period"
     return positions_hold_period
+
+
+
+
+def structral_break_test_ic(df, signal_col, target_col, break_date):
+    """
+    Test for structural break in signal predictive power at break_date.
+
+    Two tests:
+      1. Chow F-test on OLS (signal → target): tests if linear relationship changed
+      2. Fisher z-test on Spearman IC: tests if rank correlation changed
+    """
+    data = df[['date', signal_col, target_col]].dropna().copy()
+    before = data[data['date'] < break_date]
+    after = data[data['date'] >= break_date]
+    n1, n2 = len(before), len(after)
+    k = 2  # parameters: intercept + slope
+
+    # Chow test (OLS on raw values)
+    def ols_rss(x, y):
+        slope, intercept, _, _, _ = linregress(x, y)
+        return ((y - intercept - slope * x) ** 2).sum()
+
+    rss_full = ols_rss(data[signal_col].values, data[target_col].values)
+    rss_1 = ols_rss(before[signal_col].values, before[target_col].values)
+    rss_2 = ols_rss(after[signal_col].values, after[target_col].values)
+
+    f_stat = ((rss_full - rss_1 - rss_2) / k) / ((rss_1 + rss_2) / (n1 + n2 - 2 * k))
+    f_pvalue = 1 - f_dist.cdf(f_stat, k, n1 + n2 - 2 * k)
+
+    # Fisher z-test (Spearman IC)
+    ic_before = spearmanr(before[signal_col], before[target_col])[0]
+    ic_after = spearmanr(after[signal_col], after[target_col])[0]
+
+    z1 = np.arctanh(ic_before)
+    z2 = np.arctanh(ic_after)
+    se = np.sqrt(1 / (n1 - 3) + 1 / (n2 - 3))
+    z_stat = (z1 - z2) / se
+    z_pvalue = 2 * (1 - stats.norm.cdf(abs(z_stat)))  # two-sided
+
+    # Output
+    print(f"Break date: {break_date}")
+    print(f"  Before: n={n1}, IC={ic_before:.4f}")
+    print(f"  After:  n={n2}, IC={ic_after:.4f}")
+    print(f"  ΔIC:    {ic_after - ic_before:.4f}")
+    print(
+        f"\n  Chow F-test:   F={f_stat:.3f}, p={f_pvalue:.4f} {'***' if f_pvalue < 0.01 else '**' if f_pvalue < 0.05 else '*' if f_pvalue < 0.1 else ''}")
+    print(
+        f"  Fisher z-test: z={z_stat:.3f}, p={z_pvalue:.4f} {'***' if z_pvalue < 0.01 else '**' if z_pvalue < 0.05 else '*' if z_pvalue < 0.1 else ''}")
+
+    return pd.Series({
+        'ic_before': ic_before,
+        'ic_after': ic_after,
+        'delta_ic': ic_after - ic_before,
+        'chow_f': f_stat,
+        'chow_p': f_pvalue,
+        'fisher_z': z_stat,
+        'fisher_p': z_pvalue,
+        'n_before': n1,
+        'n_after': n2,
+    })
+
+
+
+
+def confounder_test(df, signal_col, target_col, confounder_col):
+    """
+    Test if signal's IC survives after controlling for a confounder.
+    Method: rank-based residualization (partial Spearman IC).
+    """
+    data = df[[signal_col, target_col, confounder_col]].dropna().copy()
+    n = len(data)
+
+    # Raw ICs
+    raw_ic, raw_p = spearmanr(data[signal_col], data[target_col])
+    conf_ic, conf_p = spearmanr(data[confounder_col], data[target_col])
+
+    # Partial IC: residualize signal and target ranks on confounder rank
+    sig_rank = data[signal_col].rank()
+    tgt_rank = data[target_col].rank()
+    conf_rank = data[confounder_col].rank()
+
+    slope_s, int_s, _, _, _ = linregress(conf_rank, sig_rank)
+    resid_signal = sig_rank - (int_s + slope_s * conf_rank)
+
+    slope_t, int_t, _, _, _ = linregress(conf_rank, tgt_rank)
+    resid_target = tgt_rank - (int_t + slope_t * conf_rank)
+
+    partial_ic = np.corrcoef(resid_signal, resid_target)[0, 1]
+    t_stat = partial_ic * np.sqrt((n - 3) / (1 - partial_ic ** 2))
+    partial_p = 2 * (1 - stats.t.cdf(abs(t_stat), n - 3))
+
+    # How much IC is explained by confounder
+    pct_explained = (1 - abs(partial_ic) / max(abs(raw_ic), 1e-10)) * 100
+
+    print(f"Confounder test: {signal_col} → {target_col} | {confounder_col}")
+    print(f"  Raw IC:          {raw_ic:.4f}  (p={raw_p:.4f})")
+    print(f"  Confounder IC:   {conf_ic:.4f}  (p={conf_p:.4f})")
+    print(f"  Partial IC:      {partial_ic:.4f}  (p={partial_p:.4f})")
+    print(f"  IC explained by confounder: {pct_explained:.1f}%")
+    if abs(partial_ic) < 0.02 or partial_p > 0.05:
+        print(f"  → Signal DISAPPEARS after controlling for {confounder_col}")
+    elif abs(partial_ic) > abs(raw_ic) * 0.5:
+        print(f"  → Signal SURVIVES (retains >{abs(partial_ic)/abs(raw_ic)*100:.0f}% of IC)")
+    else:
+        print(f"  → Signal WEAKENED but partially survives")
+
+    return pd.Series({
+        'raw_ic': raw_ic,
+        'raw_p': raw_p,
+        'confounder_ic': conf_ic,
+        'confounder_p': conf_p,
+        'partial_ic': partial_ic,
+        'partial_p': partial_p,
+        'pct_explained': pct_explained,
+    })
+
+
+
+
 
